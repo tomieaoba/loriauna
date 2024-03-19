@@ -1,0 +1,131 @@
+const hubspot = require('@hubspot/api-client');
+
+const hubspotClient = new hubspot.Client({ accessToken: process.env.DedupSecret });
+
+exports.main = async (event, callback) => {
+    let hs_execution_state = 'SUCCESS';
+    let duplicateFound = 'NO';
+    let error = '';
+    let rateLimit = 'NO';
+    let mergedContactIDs = [];
+
+    try {
+        const triggeringContactId = event.object.objectId.toString();
+        const contactProperties = ['phone', 'firstname', 'lastname', 'jobtitle'];
+        const contactResult = await handleRateLimit(() => hubspotClient.crm.contacts.basicApi.getById(triggeringContactId, contactProperties));
+        if (!contactResult || !contactResult.properties) {
+            throw new Error('Failed to fetch contact details.');
+        }
+
+        const { firstname: firstName, lastname: lastName, phone, jobtitle: jobTitle } = contactResult.properties;
+
+        // Normalize phone number by removing all symbols but keeping the leading "1" if present
+        const normalizedPhoneWith1 = phone ? phone.replace(/\D/g, '').replace(/^1?/, '1') : '';
+        // Fully normalize phone number by removing all symbols and any leading "1"
+        const fullyNormalizedPhone = phone ? phone.replace(/\D/g, '').replace(/^1/, '') : '';
+
+        // Original phone number search
+        if (phone) {
+            let searchResults = await handleRateLimit(() => searchForDuplicates(firstName, lastName, phone, 'phone', triggeringContactId));
+            console.log(`Search results for phone "${phone}":`, JSON.stringify(searchResults, null, 2));
+            await processSearchResults(searchResults, triggeringContactId, mergedContactIDs);
+        }
+
+        // Normalized phone number with leading "1"
+        if (normalizedPhoneWith1 && normalizedPhoneWith1 !== phone) {
+            let searchResults = await handleRateLimit(() => searchForDuplicates(firstName, lastName, normalizedPhoneWith1, 'phone', triggeringContactId));
+            console.log(`Search results for phone with '1' "${normalizedPhoneWith1}":`, JSON.stringify(searchResults, null, 2));
+            await processSearchResults(searchResults, triggeringContactId, mergedContactIDs);
+        }
+
+        // Fully normalized phone number
+        if (fullyNormalizedPhone && fullyNormalizedPhone !== phone && fullyNormalizedPhone !== normalizedPhoneWith1) {
+            let searchResults = await handleRateLimit(() => searchForDuplicates(firstName, lastName, fullyNormalizedPhone, 'phone', triggeringContactId));
+            console.log(`Search results for fully normalized phone "${fullyNormalizedPhone}":`, JSON.stringify(searchResults, null, 2));
+            await processSearchResults(searchResults, triggeringContactId, mergedContactIDs);
+        }
+
+        // Job title search
+        if (jobTitle) {
+            const searchResults = await handleRateLimit(() => searchForDuplicates(firstName, lastName, jobTitle, 'jobtitle', triggeringContactId));
+            console.log(`Search results for job title "${jobTitle}":`, JSON.stringify(searchResults, null, 2));
+            await processSearchResults(searchResults, triggeringContactId, mergedContactIDs);
+        }
+
+        duplicateFound = mergedContactIDs.length > 0 ? 'YES' : 'NO';
+
+    } catch (e) {
+        hs_execution_state = 'ERROR';
+        error = e.message || 'An error occurred during execution.';
+        if (e.response && e.response.status === 429) {
+            rateLimit = 'YES';
+            console.log('Rate limit exceeded. Waiting for 1 minute before retrying...');
+            await new Promise(resolve => setTimeout(resolve, 60000)); // Wait for 1 minute
+            console.log('Retry after waiting...');
+            await exports.main(event, callback); // Retry the operation after waiting
+        }
+    } finally {
+        callback({
+            outputFields: {
+                'hs_execution_state': hs_execution_state,
+                'DuplicateFound': duplicateFound,
+                'Error': error,
+                'RateLimit': rateLimit,
+                'Merged_Contact_IDs': mergedContactIDs.join(', ')
+            }
+        });
+    }
+};
+
+async function searchForDuplicates(firstName, lastName, searchValue, valueType, excludingId) {
+    let filters = [
+        { propertyName: 'firstname', operator: 'EQ', value: firstName },
+        { propertyName: 'lastname', operator: 'EQ', value: lastName },
+        { propertyName: valueType, operator: 'EQ', value: searchValue }
+    ];
+
+    const searchQuery = {
+        filterGroups: [{ filters }],
+        properties: ['firstname', 'lastname', 'phone', 'jobtitle']
+    };
+
+    try {
+        const searchResults = await hubspotClient.crm.contacts.searchApi.doSearch(searchQuery);
+        return searchResults;
+    } catch (error) {
+        console.error('Search Error:', error);
+        throw error;
+    }
+}
+
+async function processSearchResults(searchResults, triggeringContactId, mergedContactIDs) {
+    if (searchResults.total > 0) {
+        for (const result of searchResults.results) {
+            if (result.id !== triggeringContactId) {
+                try {
+                    const mergeInput = { primaryObjectId: triggeringContactId, objectIdToMerge: result.id };
+                    await handleRateLimit(() => hubspotClient.crm.contacts.publicObjectApi.merge(mergeInput));
+                    console.log(`Successfully merged contact ID ${result.id} into triggering contact ID ${triggeringContactId}.`);
+                    mergedContactIDs.push(result.id);
+                } catch (error) {
+                    console.error(`Failed to merge contact ID ${result.id}:`, error.message);
+                }
+            }
+        }
+    }
+}
+
+async function handleRateLimit(apiCall) {
+    try {
+        return await apiCall();
+    } catch (error) {
+        if (error.response && error.response.status === 429) {
+            console.log('Rate limit exceeded. Waiting for 1 minute before retrying...');
+            await new Promise(resolve => setTimeout(resolve, 60000)); // Wait for 1 minute
+            console.log('Retry after waiting...');
+            return await handleRateLimit(apiCall); // Retry the API call after waiting
+        } else {
+            throw error;
+        }
+    }
+}
